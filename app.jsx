@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { Upload, DollarSign, Users, PieChart, TrendingUp, AlertCircle, FileText, Settings, Save, X } from 'lucide-react';
+import { Upload, DollarSign, Users, PieChart, TrendingUp, AlertCircle, FileText, Settings, Save, X, Plus, Trash2, Download } from 'lucide-react';
 
 // --- Pricing Configuration (Default based on user input) ---
 const INITIAL_PRICING = {
@@ -64,21 +64,51 @@ export default function App() {
   });
   const [pricing, setPricing] = useState(INITIAL_PRICING);
   const [showSettings, setShowSettings] = useState(false);
+  const [newProductName, setNewProductName] = useState('');
+  const [libsLoaded, setLibsLoaded] = useState(false);
 
-  // Load PapaParse for CSV reading
+  // Load External Libraries (PapaParse + jsPDF) from CDN sequentially
   useEffect(() => {
-    const script = document.createElement('script');
-    script.src = 'https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js';
-    script.async = true;
-    document.body.appendChild(script);
-    return () => {
-      document.body.removeChild(script);
+    const loadScript = (src) => {
+      return new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.async = true;
+        script.onload = resolve;
+        script.onerror = reject;
+        document.body.appendChild(script);
+      });
     };
+
+    const loadLibraries = async () => {
+      try {
+        // 1. Load PapaParse
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js');
+        
+        // 2. Load jsPDF
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js');
+        
+        // 3. Shim jsPDF so autoTable can find it
+        if (window.jspdf && window.jspdf.jsPDF) {
+          window.jsPDF = window.jspdf.jsPDF;
+        }
+
+        // 4. Load autoTable (must happen AFTER jsPDF is ready and shimmed)
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.5.29/jspdf.plugin.autotable.min.js');
+        
+        setLibsLoaded(true);
+        console.log("External libraries loaded successfully");
+      } catch (err) {
+        console.error("Failed to load libraries", err);
+      }
+    };
+
+    loadLibraries();
   }, []);
 
   const handleFileUpload = (event) => {
     const file = event.target.files[0];
-    if (file) {
+    if (file && window.Papa) {
       setFileName(file.name);
       window.Papa.parse(file, {
         header: true,
@@ -90,17 +120,41 @@ export default function App() {
     }
   };
 
+  const handleAddProduct = () => {
+    if (!newProductName.trim()) return;
+    const key = newProductName.trim().toLowerCase();
+    
+    // Prevent duplicates
+    if (pricing[key]) {
+      alert('Product already exists');
+      return;
+    }
+
+    setPricing(prev => ({
+      ...prev,
+      [key]: {
+        selling: 0,
+        tiers: [{ limit: Infinity, cost: 0 }]
+      }
+    }));
+    setNewProductName('');
+  };
+
+  const handleDeleteProduct = (key) => {
+    if (window.confirm(`Delete pricing for "${key}"?`)) {
+      const newPricing = { ...pricing };
+      delete newPricing[key];
+      setPricing(newPricing);
+    }
+  };
+
   // --- Calculation Logic ---
   const report = useMemo(() => {
     if (!csvData.length) return null;
 
-    // 1. Count Products (Filter for Delivered only? User asked for total sales usually, but let's stick to the file content)
-    // The user's previous requests implied they want to calculate based on the uploaded file rows.
-    
     const counts = {};
     
     csvData.forEach(row => {
-      // Extract Product Name logic: "Product Name (Color, Size)" -> "Product Name"
       const rawDesc = row['PARCEL DESCRIPTION'] || "";
       const name = rawDesc.split(' (')[0].trim();
       const normalizedName = name.toLowerCase();
@@ -110,21 +164,16 @@ export default function App() {
       }
     });
 
-    // 2. Financials
     let totalRevenue = 0;
     let totalCOGS = 0;
     const productBreakdown = [];
 
     Object.keys(counts).forEach(prodKey => {
       const count = counts[prodKey];
-      // Find matching pricing config (fuzzy match or exact match on key)
-      // We rely on the keys in INITIAL_PRICING matching the normalized name
       const priceConfig = pricing[prodKey] || { selling: 0, tiers: [{ limit: Infinity, cost: 0 }] };
       
-      // Calculate Revenue
       const revenue = count * priceConfig.selling;
 
-      // Calculate Cost (Tiered)
       let remainingCount = count;
       let cost = 0;
       
@@ -138,7 +187,6 @@ export default function App() {
       totalRevenue += revenue;
       totalCOGS += cost;
 
-      // Capitalize name for display
       const displayName = prodKey.replace(/\b\w/g, l => l.toUpperCase());
 
       productBreakdown.push({
@@ -150,14 +198,12 @@ export default function App() {
       });
     });
 
-    // Sort by count desc
     productBreakdown.sort((a, b) => b.count - a.count);
 
     const grossProfit = totalRevenue - totalCOGS;
     const totalExpenses = Number(expenses.advertising) + Number(expenses.returns) + Number(expenses.other);
     const netProfit = grossProfit - totalExpenses;
 
-    // Partner Shares
     const samilaShare = netProfit * 0.50;
     const remainder = netProfit - samilaShare;
     const partnerShare = remainder / 3;
@@ -180,6 +226,101 @@ export default function App() {
     return new Intl.NumberFormat('en-LK', { style: 'currency', currency: 'LKR' }).format(val);
   };
 
+  // --- PDF Export Logic ---
+  const handleExportPDF = () => {
+    if (!report || !libsLoaded || !window.jsPDF) {
+      alert("PDF Library not loaded yet. Please wait a moment.");
+      return;
+    }
+
+    // Use window.jsPDF (which autoTable attached to)
+    const doc = new window.jsPDF();
+    const date = new Date().toLocaleDateString();
+
+    // Header
+    doc.setFontSize(22);
+    doc.setTextColor(40);
+    doc.text("Partner Profit Report", 14, 22);
+    doc.setFontSize(10);
+    doc.setTextColor(100);
+    doc.text(`Generated on: ${date}`, 14, 28);
+
+    // Summary Section
+    doc.setFontSize(14);
+    doc.setTextColor(40);
+    doc.text("Financial Summary", 14, 40);
+
+    const summaryData = [
+      ["Total Revenue", formatCurrency(report.totalRevenue)],
+      ["Cost of Goods Sold (COGS)", formatCurrency(report.totalCOGS)],
+      ["Gross Profit", formatCurrency(report.grossProfit)],
+      ["Total Expenses (Ads +)", formatCurrency(report.totalExpenses)],
+      ["NET PROFIT", formatCurrency(report.netProfit)]
+    ];
+
+    doc.autoTable({
+      startY: 45,
+      head: [['Metric', 'Amount']],
+      body: summaryData,
+      theme: 'striped',
+      headStyles: { fillColor: [37, 99, 235] }, // Blue-600
+      columnStyles: {
+        0: { fontStyle: 'bold' },
+        1: { halign: 'right' }
+      }
+    });
+
+    // Profit Distribution
+    doc.text("Profit Distribution", 14, doc.lastAutoTable.finalY + 15);
+    
+    const distributionData = [
+      ["Samila (Investor - 50%)", formatCurrency(report.shares.samila)],
+      ["You (Partner)", formatCurrency(report.shares.others)],
+      ["Sandun (Partner)", formatCurrency(report.shares.others)],
+      ["Krishan (Partner)", formatCurrency(report.shares.others)],
+    ];
+
+    doc.autoTable({
+      startY: doc.lastAutoTable.finalY + 20,
+      head: [['Partner', 'Share Amount']],
+      body: distributionData,
+      theme: 'grid',
+      headStyles: { fillColor: [16, 185, 129] }, // Emerald-500
+      columnStyles: { 1: { halign: 'right', fontStyle: 'bold' } }
+    });
+
+    // Product Breakdown
+    doc.text("Product Performance", 14, doc.lastAutoTable.finalY + 15);
+
+    const productData = report.productBreakdown.map(item => [
+      item.name,
+      item.count,
+      formatCurrency(item.revenue),
+      formatCurrency(item.gross)
+    ]);
+
+    doc.autoTable({
+      startY: doc.lastAutoTable.finalY + 20,
+      head: [['Product', 'Count', 'Revenue', 'Gross Profit']],
+      body: productData,
+      theme: 'striped',
+      headStyles: { fillColor: [71, 85, 105] }, // Slate-600
+      columnStyles: { 
+        1: { halign: 'center' },
+        2: { halign: 'right' },
+        3: { halign: 'right' }
+      }
+    });
+
+    // Footer
+    const pageHeight = doc.internal.pageSize.height;
+    doc.setFontSize(8);
+    doc.setTextColor(150);
+    doc.text("Generated by Partner Profit Manager", 14, pageHeight - 10);
+
+    doc.save(`Profit_Report_${date.replace(/\//g, '-')}.pdf`);
+  };
+
   return (
     <div className="min-h-screen bg-slate-50 font-sans text-slate-800 p-4 md:p-8">
       <div className="max-w-6xl mx-auto space-y-8">
@@ -191,6 +332,16 @@ export default function App() {
             <p className="text-slate-500">Track sales, expenses, and split profits automatically.</p>
           </div>
           <div className="flex gap-2">
+             {/* PDF Export Button */}
+             <button 
+              onClick={handleExportPDF}
+              disabled={!report || !libsLoaded}
+              className={`flex items-center space-x-2 px-4 py-2 border rounded-lg transition ${report && libsLoaded ? 'bg-blue-600 text-white hover:bg-blue-700 border-blue-600' : 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'}`}
+            >
+              <Download className="w-4 h-4" />
+              <span>{libsLoaded ? 'Export PDF' : 'Loading PDF...'}</span>
+            </button>
+
              <button 
               onClick={() => setShowSettings(!showSettings)}
               className="flex items-center space-x-2 px-4 py-2 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 text-slate-700 transition"
@@ -201,7 +352,7 @@ export default function App() {
           </div>
         </div>
 
-        {/* Pricing Settings Modal (Hidden by default) */}
+        {/* Pricing Settings Modal */}
         {showSettings && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
             <div className="bg-white rounded-xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
@@ -213,27 +364,63 @@ export default function App() {
                 <div className="bg-blue-50 p-4 rounded-lg text-sm text-blue-800">
                   These settings define how costs are calculated. The "Limit" defines how many units are bought at a specific "Cost". Use Infinity for the last tier.
                 </div>
+
+                {/* Add New Product Section */}
+                <div className="bg-slate-100 p-4 rounded-lg flex flex-col md:flex-row gap-3 items-end md:items-center">
+                   <div className="flex-1 w-full">
+                     <label className="block text-xs font-semibold text-slate-500 mb-1">Add New Product</label>
+                     <input 
+                        type="text" 
+                        placeholder="Product Name (e.g. Magic Glue)" 
+                        className="w-full border rounded px-3 py-2 text-sm"
+                        value={newProductName}
+                        onChange={(e) => setNewProductName(e.target.value)}
+                        onKeyDown={(e) => e.key === 'Enter' && handleAddProduct()}
+                     />
+                   </div>
+                   <button 
+                    onClick={handleAddProduct}
+                    className="bg-emerald-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-emerald-700 transition flex items-center"
+                   >
+                     <Plus className="w-4 h-4 mr-1" /> Add
+                   </button>
+                </div>
+
+                <div className="border-t border-slate-100 my-4"></div>
+
                 {Object.entries(pricing).map(([key, config]) => (
-                  <div key={key} className="border p-4 rounded-lg">
-                    <h3 className="font-bold capitalize mb-2">{key}</h3>
+                  <div key={key} className="border p-4 rounded-lg relative group">
+                    <div className="flex justify-between items-center mb-3">
+                        <h3 className="font-bold capitalize text-slate-800">{key}</h3>
+                        <button 
+                            onClick={() => handleDeleteProduct(key)}
+                            className="text-slate-400 hover:text-red-500 transition p-1"
+                            title="Remove Product"
+                        >
+                            <Trash2 className="w-4 h-4" />
+                        </button>
+                    </div>
+                    
                     <div className="grid grid-cols-2 gap-4 mb-2">
-                       <label className="text-xs font-semibold text-slate-500">Selling Price</label>
-                       <input 
-                          type="number" 
-                          value={config.selling}
-                          onChange={(e) => {
-                            const newPricing = {...pricing};
-                            newPricing[key].selling = parseFloat(e.target.value);
-                            setPricing(newPricing);
-                          }}
-                          className="border rounded px-2 py-1"
-                       />
+                       <div>
+                           <label className="text-xs font-semibold text-slate-500">Selling Price</label>
+                           <input 
+                              type="number" 
+                              value={config.selling}
+                              onChange={(e) => {
+                                const newPricing = {...pricing};
+                                newPricing[key].selling = parseFloat(e.target.value);
+                                setPricing(newPricing);
+                              }}
+                              className="border rounded px-2 py-1 w-full text-sm"
+                           />
+                       </div>
                     </div>
                     <div className="space-y-2">
                       <p className="text-xs font-semibold text-slate-500">Cost Tiers</p>
                       {config.tiers.map((tier, idx) => (
                         <div key={idx} className="flex gap-2 items-center">
-                          <span className="text-sm text-slate-400">Qty:</span>
+                          <span className="text-sm text-slate-400 w-8">Qty:</span>
                           <input 
                             type="number" 
                             disabled={tier.limit === Infinity}
@@ -243,7 +430,7 @@ export default function App() {
                                newPricing[key].tiers[idx].limit = parseFloat(e.target.value);
                                setPricing(newPricing);
                             }}
-                            className="border rounded px-2 py-1 w-24 text-sm"
+                            className="border rounded px-2 py-1 w-20 text-sm"
                           />
                           <span className="text-sm text-slate-400">@ Cost:</span>
                           <input 
@@ -254,7 +441,7 @@ export default function App() {
                                newPricing[key].tiers[idx].cost = parseFloat(e.target.value);
                                setPricing(newPricing);
                             }}
-                            className="border rounded px-2 py-1 w-24 text-sm"
+                            className="border rounded px-2 py-1 w-20 text-sm"
                           />
                         </div>
                       ))}
